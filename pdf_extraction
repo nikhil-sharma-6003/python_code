@@ -1,0 +1,572 @@
+#PymuPDF sample - with table normalization complete only normalization issue
+import pymupdf
+import pandas as pd
+import re
+import time
+
+enova_2017 = r"D:\Downloads\Financial Data\ENVA (Enova International Inc.)  (10-K) 2018-02-26.pdf"
+
+start_time = time.time()
+doc=pymupdf.open (enova_2017)
+all_words = []
+
+def is_currency(text):
+    return bool(re.fullmatch(r'[$€£₹¥]', text.strip()))
+
+def is_number(text):
+    text = text.strip()
+    return bool(re.fullmatch(r'-?\d[\d,]*\.?\d*%?', text))
+
+def is_open_paren(text):
+    return text.strip() == "("
+
+def is_close_paren(text):
+    return text.strip() == ")"
+
+def is_dash(text):
+    return text.strip() in {"—", "-", "–"}
+
+def is_numeric_like(text):
+    return bool(re.search(r'\d', text))
+
+def is_bullet(text):
+    return text.strip() in {"•", "·", "-", "–", "—", "*"}
+    
+def assign_visual_lines(page_df, y_tolerance=2):
+    page_df = page_df.sort_values(["block_no", "y0"])
+
+    visual_line = 0
+    line_ids = []
+
+    prev_block = None
+    prev_y = None
+
+    for _, row in page_df.iterrows():
+
+        if prev_block != row.block_no:
+            visual_line += 1
+
+        elif prev_y is not None and abs(row.y0 - prev_y) > y_tolerance:
+            visual_line += 1
+
+        line_ids.append(visual_line)
+
+        prev_block = row.block_no
+        prev_y = row.y0
+
+    page_df["visual_line"] = line_ids
+    return page_df
+
+def merge_words_in_line(line_df, threshold=2):
+    # sort words left → right
+    line_df = line_df.sort_values("x0").reset_index(drop=True)
+
+    merged_cells = []
+    
+    current_text = line_df.loc[0, "word"]
+    current_x0 = line_df.loc[0, "x0"]
+    current_x1 = line_df.loc[0, "x1"]
+    current_y0 = line_df.loc[0, "y0"]
+    current_y1 = line_df.loc[0, "y1"]
+
+    for i in range(1, len(line_df)):
+        next_x0 = line_df.loc[i, "x0"]
+        next_x1 = line_df.loc[i, "x1"]
+        next_y0 = line_df.loc[i, "y0"]
+        next_y1 = line_df.loc[i, "y1"]
+        next_word = line_df.loc[i, "word"]
+
+        gap = round(next_x0 - current_x1,3)
+
+        if gap <= threshold:
+            # merge words
+            current_text += " " + next_word
+            
+            # overwrite x1 with next word x1 (keeps spacing logic intact)
+            current_x1 = next_x1
+            current_y1 = next_y1
+        else:
+            # save current cell
+            merged_cells.append((current_text, current_x0, current_x1, current_y0, current_y1))
+
+            # start new cell
+            current_text = next_word
+            current_x0 = next_x0
+            current_x1 = next_x1
+            current_y0 = next_y0
+            current_y1 = next_y1
+
+    # append last cell
+    merged_cells.append((current_text, current_x0, current_x1, current_y0, current_y1))
+
+    return merged_cells
+
+def merge_currency_cells(cells):
+    """
+    cells = list of tuples:
+    (text, x0, x1, y0, y1)
+
+    Rules:
+    • Merge currency + number/dash/negative
+    • Align merged cell to numeric column (x0/x1 from number)
+    • Preserve vertical bounds
+    """
+
+    merged = []
+    i = 0
+
+    while i < len(cells):
+
+        text, x0, x1, y0, y1 = cells[i]
+
+        # --------------------------------------------------
+        # CASE 1: currency + number OR dash OR negative
+        # Align to numeric column
+        # --------------------------------------------------
+        if (
+            i < len(cells) - 1
+            and is_currency(text)
+            and (
+                is_number(cells[i+1][0])
+                or is_dash(cells[i+1][0])
+                or cells[i+1][0].strip().startswith('-')
+            )
+        ):
+            next_text, nx0, nx1, ny0, ny1 = cells[i+1]
+
+            merged.append((
+                text + " " + next_text,
+                nx0,   # ⭐ numeric alignment
+                nx1,
+                min(y0, ny0),
+                max(y1, ny1)
+            ))
+            i += 2
+            continue
+
+        # --------------------------------------------------
+        # CASE 2: currency + ( number )
+        # Example: $ (1,234)
+        # --------------------------------------------------
+        if (
+            i < len(cells) - 3
+            and is_currency(text)
+            and is_open_paren(cells[i+1][0])
+            and is_number(cells[i+2][0])
+            and is_close_paren(cells[i+3][0])
+        ):
+            _, _, _, ny0, ny1 = cells[i+3]
+
+            merged.append((
+                f"{text} ({cells[i+2][0]})",
+                cells[i+2][1],  # align with number
+                cells[i+2][2],
+                min(y0, ny0),
+                max(y1, ny1)
+            ))
+            i += 4
+            continue
+
+        # --------------------------------------------------
+        # CASE 3: ( currency number )
+        # Example: ($ 1,234)
+        # --------------------------------------------------
+        if (
+            i < len(cells) - 3
+            and is_open_paren(text)
+            and is_currency(cells[i+1][0])
+            and is_number(cells[i+2][0])
+            and is_close_paren(cells[i+3][0])
+        ):
+            _, _, _, ny0, ny1 = cells[i+3]
+
+            merged.append((
+                f"({cells[i+1][0]} {cells[i+2][0]})",
+                cells[i+2][1],  # numeric alignment
+                cells[i+2][2],
+                min(y0, ny0),
+                max(y1, ny1)
+            ))
+            i += 4
+            continue
+
+        # --------------------------------------------------
+        # DEFAULT: no merge
+        # --------------------------------------------------
+        merged.append((text, x0, x1, y0, y1))
+        i += 1
+
+    return merged
+
+
+def normalize_single_cell_table_lines(page_df):
+    """
+    Promote single-cell lines between table rows into table rows
+    by adding empty cells using table column geometry.
+    """
+
+    page_df = page_df.sort_values(["line_no", "x0"]).copy()
+
+    # count cells per line
+    line_counts = page_df.groupby("line_no").size()
+
+    # identify table lines
+    table_lines = set(page_df[page_df["comment"] == "This is a table"]["line_no"])
+
+    # find reference line (max columns)
+    if not table_lines:
+        return page_df
+
+    ref_line = max(table_lines, key=lambda ln: line_counts.get(ln, 0))
+
+    ref_rows = page_df[page_df["line_no"] == ref_line].sort_values("x0")
+
+    # bounding boxes of columns (skip first column)
+    reference_boxes = ref_rows.iloc[1:][["x0","x1","y0","y1"]].values.tolist()
+
+    new_rows = []
+
+    for line_no in page_df["line_no"].unique():
+
+        # candidate: exactly one cell and between table lines
+        if (
+            line_counts.get(line_no, 0) == 1
+            and ((line_no - 1) in table_lines or (line_no - 2) in table_lines)
+            and ((line_no + 1) in table_lines or (line_no + 2) in table_lines)
+        ):
+            base_row = page_df[page_df["line_no"] == line_no].iloc[0]
+
+            # create empty cells using reference geometry
+            for x0, x1, y0, y1 in reference_boxes:
+                new_rows.append({
+                    "page_num": base_row.page_num,
+                    "line_no": line_no,
+                    "text": "",
+                    "x0": x0,
+                    "x1": x1,
+                    "y0": y0,
+                    "y1": y1,
+                    "comment": "This is a table"
+                })
+
+            # update original row comment
+            page_df.loc[page_df["line_no"] == line_no, "comment"] = "This is a table"
+
+    if new_rows:
+        page_df = pd.concat([page_df, pd.DataFrame(new_rows)], ignore_index=True)
+        page_df = page_df.sort_values(["line_no","x0"]).reset_index(drop=True)
+
+    return page_df
+
+def normalize_tables(page_df, tolerance=0.05):
+    """
+    Normalize table rows while preserving unmatched cells.
+    Fixes OCR jitter without dropping data.
+    """
+
+    import pandas as pd
+
+    page_df = page_df.sort_values(["line_no", "x0"]).copy()
+
+    table_df = page_df[page_df["comment"] == "This is a table"].copy()
+    if table_df.empty:
+        return page_df
+
+    # --------------------------------------------------
+    # STEP 1: assign table numbers
+    # --------------------------------------------------
+    table_df["Table_Number"] = (
+        table_df["line_no"].diff().fillna(1).gt(1)
+    ).cumsum() + 1
+
+    table_df["Table_Number"] = "Table " + table_df["Table_Number"].astype(str)
+
+    normalized_rows = []
+
+    # --------------------------------------------------
+    # STEP 2: process each table
+    # --------------------------------------------------
+    for table_name, tdf in table_df.groupby("Table_Number"):
+
+        line_counts = tdf.groupby("line_no").size()
+        max_line = line_counts.idxmax()
+        max_row = tdf[tdf["line_no"] == max_line].sort_values("x0")
+
+        ref_cols = max_row[["x0","x1","y0","y1"]].values.tolist()
+        ref_count = len(ref_cols)
+
+        table_width = max_row["x1"].max() - max_row["x0"].min()
+        tol_px = table_width * tolerance
+
+        for line_no, line_df in tdf.groupby("line_no"):
+
+            line_df = line_df.sort_values("x0").reset_index(drop=True)
+            aligned = [None] * ref_count
+            unmatched = []
+
+            # ---------- PASS 1: tolerance match ----------
+            for _, row in line_df.iterrows():
+                matched = False
+                for idx, (rx0, rx1, ry0, ry1) in enumerate(ref_cols):
+                    if abs(row.x0 - rx0) <= tol_px:
+                        aligned[idx] = row
+                        matched = True
+                        break
+                if not matched:
+                    unmatched.append(row)
+
+            # ---------- PASS 2: neighbor alignment ----------
+            for row in unmatched:
+                # find closest reference column
+                distances = [abs(row.x0 - rx0) for rx0, *_ in ref_cols]
+                nearest_idx = distances.index(min(distances))
+
+                # check neighbors in same row
+                left_ok = nearest_idx > 0 and aligned[nearest_idx-1] is not None
+                right_ok = nearest_idx < ref_count-1 and aligned[nearest_idx+1] is not None
+
+                if left_ok or right_ok:
+                    # snap to nearest column box
+                    aligned[nearest_idx] = row
+                else:
+                    # keep original box (append later)
+                    aligned.append(row)
+
+            # ---------- BUILD ROW ----------
+            for idx in range(ref_count):
+                if idx < len(aligned) and aligned[idx] is not None:
+                    row = aligned[idx]
+
+                    normalized_rows.append({
+                        "page_num": row.page_num,
+                        "line_no": line_no,
+                        "text": row.text,
+                        "x0": ref_cols[idx][0],
+                        "x1": ref_cols[idx][1],
+                        "y0": ref_cols[idx][2],
+                        "y1": ref_cols[idx][3],
+                        "comment": "This is a table",
+                        "Table_Number": table_name
+                    })
+                else:
+                    # insert blank ONLY if truly missing
+                    normalized_rows.append({
+                        "page_num": line_df.iloc[0].page_num,
+                        "line_no": line_no,
+                        "text": "",
+                        "x0": ref_cols[idx][0],
+                        "x1": ref_cols[idx][1],
+                        "y0": ref_cols[idx][2],
+                        "y1": ref_cols[idx][3],
+                        "comment": "This is a table",
+                        "Table_Number": table_name
+                    })
+
+            # ---------- append unmatched cells ----------
+            if len(aligned) > ref_count:
+                for extra in aligned[ref_count:]:
+                    normalized_rows.append({
+                        "page_num": extra.page_num,
+                        "line_no": line_no,
+                        "text": extra.text,
+                        "x0": extra.x0,
+                        "x1": extra.x1,
+                        "y0": extra.y0,
+                        "y1": extra.y1,
+                        "comment": "This is a table",
+                        "Table_Number": table_name
+                    })
+
+    normalized_df = pd.DataFrame(normalized_rows)
+
+    non_table = page_df[page_df["comment"] != "This is a table"]
+
+    return pd.concat([non_table, normalized_df]) \
+             .sort_values(["line_no","x0"]) \
+             .reset_index(drop=True)
+
+def extract_normalized_tables(pages):
+    """
+    Extract structured tables from normalized page data.
+
+    pages = {page_num: dataframe}
+    returns:
+        { page_num: [(table_name, table_df), ...] }
+    """
+
+    tables_output = {}
+
+    for page_num, df in pages.items():
+
+        if "Table_Number" not in df.columns:
+            continue
+
+        page_tables = []
+
+        table_rows = df[df["comment"] == "This is a table"]
+
+        for table_name, tdf in table_rows.groupby("Table_Number"):
+
+            # ensure proper order
+            tdf = tdf.sort_values(["line_no", "x0"])
+
+            structured_rows = []
+
+            for line_no, line_df in tdf.groupby("line_no"):
+                structured_rows.append(line_df["text"].tolist())
+
+            table_df = pd.DataFrame(structured_rows)
+
+            page_tables.append((table_name, table_df))
+
+        if page_tables:
+            tables_output[page_num] = page_tables
+
+    return tables_output
+
+def is_fake_table(table_df, text_threshold=0.6):
+    """
+    Returns True if table is likely fake.
+    """
+
+    if table_df.empty:
+        return True
+
+    # flatten values
+    values = table_df.fillna("").astype(str).values.flatten()
+
+    non_empty = [v.strip() for v in values if v.strip()]
+
+    # Rule 1: empty
+    if len(non_empty) == 0:
+        return True
+
+    # Rule 2: single-column text (paragraph)
+    if table_df.shape[1] == 1:
+        return True
+
+    # Rule 3: only one row
+    if table_df.shape[0] == 1:
+        return True
+
+    # Rule 4: bullet list pattern
+    if table_df.shape[1] >= 2:
+        col1 = table_df.iloc[:, 0].astype(str)
+        col2 = table_df.iloc[:, 1].astype(str)
+
+        bullet_rows = sum(
+            is_bullet(a.strip()) and len(b.strip()) > 3
+            for a, b in zip(col1, col2)
+        )
+
+        if bullet_rows >= len(table_df) * 0.5:
+            return True
+
+    # Rule 5: mostly text (not numeric)
+    numeric_cells = sum(is_numeric_like(v) for v in non_empty)
+    text_ratio = 1 - (numeric_cells / len(non_empty))
+
+    if text_ratio >= text_threshold:
+        return True
+
+    return False
+
+def remove_fake_tables(tables_output):
+    """
+    Remove fake tables from extracted tables.
+    """
+
+    cleaned_output = {}
+
+    for page_num, tables in tables_output.items():
+
+        valid_tables = []
+
+        for table_name, table_df in tables:
+
+            if not is_fake_table(table_df):
+                valid_tables.append((table_name, table_df))
+
+        if valid_tables:
+            cleaned_output[page_num] = valid_tables
+
+    return cleaned_output
+
+def process_dataframe(df):
+
+    pages_output = {}
+
+    for page, page_df in df.groupby("page_num"):
+
+        # create visual lines
+        page_df = assign_visual_lines(page_df)
+
+        rows = []
+
+        for vline, line_df in page_df.groupby("visual_line"):
+
+            merged_cells = merge_words_in_line(line_df)
+
+            label = "This is a line" if len(merged_cells) == 1 else "This is a table"
+
+            # Apply currency merge ONLY for tables
+            if label == "This is a table":
+                merged_cells = merge_currency_cells(merged_cells)
+
+            for text, x0, x1, y0, y1 in merged_cells:
+                rows.append({
+                    "page_num": page,
+                    "line_no": vline,
+                    "text": text,
+                    "x0": x0,
+                    "x1": x1,
+                    "y0": y0,
+                    "y1": y1,
+                    "comment": label
+                })
+
+        page_df_result = pd.DataFrame(rows)
+        
+        # normalize header lines inside tables
+        page_df_result = normalize_single_cell_table_lines(page_df_result)
+        
+        pages_output[page] = page_df_result
+
+    return pages_output
+    
+for page_num, page in enumerate(doc):
+    words = page.get_text("words",sort=True)
+    for word in words:
+        word_data=list(word) + [page_num]
+        all_words.append(word_data)
+doc.close()
+
+df = pd.DataFrame(all_words, columns=['x0', 'y0', 'x1', 'y1', 'word', 'block_no', 'line_no', 'word_no', 'page_num'])
+#df.to_excel(r"D:\Downloads\Financial Data\New folder\Enova Dataframe complete.xlsx", index=False)
+
+pages = process_dataframe(df)
+
+for page in pages:
+    pages[page] = normalize_tables(pages[page])
+
+tables_output = extract_normalized_tables(pages)
+
+tables_output = remove_fake_tables(tables_output)
+
+#with pd.ExcelWriter(r"D:\Downloads\Financial Data\New folder\Enova Processed Pages.xlsx") as writer:
+#    for page_num, page_df in pages.items():
+#        sheet_name = f"Page_{page_num+1}"
+#        page_df.to_excel(writer,sheet_name=sheet_name, index=False)
+
+
+with pd.ExcelWriter(r"D:\Downloads\Financial Data\New folder\Enova Processed Tables.xlsx") as writer:
+    for page_num, tables in tables_output.items():
+        for table_name, table_df in tables:
+            sheet_name = f"P{page_num+1}_{table_name}".lower()
+            # Excel sheet name limit safety
+            sheet_name = sheet_name[:31]
+            table_df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+end_time = time.time()
+print(f"\nTotal runtime: {end_time - start_time:.2f} seconds")
+print("Run completed")

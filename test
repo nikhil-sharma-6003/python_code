@@ -1,0 +1,116 @@
+def clean_tables(tables_by_page, tolerance=2, text_threshold=0.9):
+    """
+    Cleans tables extracted from PDFs.
+
+    Parameters
+    ----------
+    tables_by_page : dict
+        {page_number: [table, table, ...]}
+        table = list of rows, each row = list of cell values
+
+    tolerance : int
+        allowed variation in filled cells per row
+
+    text_threshold : float
+        ratio of text cells to consider row as text
+
+    Returns
+    -------
+    dict
+        cleaned tables with metadata
+    """
+
+    import statistics
+
+    def is_filled(cell):
+        return cell is not None and str(cell).strip() != ""
+
+    def is_number(cell):
+        try:
+            float(str(cell).replace(",", ""))
+            return True
+        except:
+            return False
+
+    def mostly_text(row):
+        filled = [c for c in row if is_filled(c)]
+        if not filled:
+            return False
+        text_count = sum(not is_number(c) for c in filled)
+        return text_count / len(filled) >= text_threshold
+
+    def remove_empty(table):
+        # remove empty rows
+        table = [r for r in table if any(is_filled(c) for c in r)]
+        if not table:
+            return []
+
+        # remove empty columns
+        cols = list(zip(*table))
+        cols = [col for col in cols if any(is_filled(c) for c in col)]
+        return [list(row) for row in zip(*cols)]
+
+    cleaned_output = {}
+
+    for page, tables in tables_by_page.items():
+        cleaned_output[page] = []
+
+        for table in tables:
+
+            table = remove_empty(table)
+            meta = {
+                "column_count": 0,
+                "row_fill_counts": [],
+                "accuracy_flag": False
+            }
+
+            if not table:
+                continue
+
+            # drop if single row or column
+            if len(table) == 1 or len(table[0]) == 1:
+                continue
+
+            col_count = len(table[0])
+            meta["column_count"] = col_count
+
+            fill_counts = [sum(is_filled(c) for c in row) for row in table]
+            meta["row_fill_counts"] = fill_counts
+
+            expected = int(statistics.median(fill_counts))
+
+            cleaned_rows = []
+
+            for i, row in enumerate(table):
+                filled = fill_counts[i]
+                filled_cells = [c for c in row if is_filled(c)]
+
+                # remove page number row at end
+                if (
+                    i == len(table) - 1
+                    and filled == 1
+                    and filled_cells
+                    and is_number(filled_cells[0])
+                ):
+                    continue
+
+                # keep consistent rows
+                if abs(filled - expected) <= tolerance:
+                    cleaned_rows.append(row)
+                    continue
+
+                # remove trailing text rows
+                if filled < expected - tolerance and mostly_text(row):
+                    continue
+
+                # inconsistent row → keep but flag table
+                cleaned_rows.append(row)
+                meta["accuracy_flag"] = True
+
+            if cleaned_rows:
+                cleaned_output[page].append({
+                    "table": cleaned_rows,
+                    "meta": meta
+                })
+
+    return cleaned_output
